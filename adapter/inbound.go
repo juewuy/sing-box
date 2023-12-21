@@ -55,6 +55,7 @@ type InboundContext struct {
 	SourcePortMatch         bool
 	DestinationAddressMatch bool
 	DestinationPortMatch    bool
+	IsResolved              bool
 	DnsFallBack             bool
 }
 
