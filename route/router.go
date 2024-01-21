@@ -56,6 +56,8 @@ type Router struct {
 	inboundByTag                       map[string]adapter.Inbound
 	outbounds                          []adapter.Outbound
 	outboundByTag                      map[string]adapter.Outbound
+	outboundProviders                  []adapter.OutboundProvider
+	outboundProviderByTag              map[string]adapter.OutboundProvider
 	rules                              []adapter.Rule
 	routeRuleByUUID                    map[string]adapter.Rule
 	defaultDetour                      string
@@ -116,6 +118,7 @@ func NewRouter(
 		dnsLogger:             logFactory.NewLogger("dns"),
 		overrideLogger:        logFactory.NewLogger("override"),
 		outboundByTag:         make(map[string]adapter.Outbound),
+		outboundProviderByTag: make(map[string]adapter.OutboundProvider),
 		rules:                 make([]adapter.Rule, 0, len(options.Rules)),
 		routeRuleByUUID:       make(map[string]adapter.Rule),
 		dnsRules:              make([]adapter.DNSRule, 0, len(dnsOptions.Rules)),
@@ -368,10 +371,14 @@ func NewRouter(
 	return router, nil
 }
 
-func (r *Router) Initialize(inbounds []adapter.Inbound, outbounds []adapter.Outbound, defaultOutbound func() adapter.Outbound) error {
+func (r *Router) Initialize(inbounds []adapter.Inbound, outboundProviders []adapter.OutboundProvider, outbounds []adapter.Outbound) error {
 	inboundByTag := make(map[string]adapter.Inbound)
 	for _, inbound := range inbounds {
 		inboundByTag[inbound.Tag()] = inbound
+	}
+	outboundProviderByTag := make(map[string]adapter.OutboundProvider)
+	for _, provider := range outboundProviders {
+		outboundProviderByTag[provider.Tag()] = provider
 	}
 	outboundByTag := make(map[string]adapter.Outbound)
 	for _, detour := range outbounds {
@@ -394,6 +401,9 @@ func (r *Router) Initialize(inbounds []adapter.Inbound, outbounds []adapter.Outb
 	var index, packetIndex int
 	if defaultOutboundForConnection == nil {
 		for i, detour := range outbounds {
+			if detour.Tag() == "OUTBOUNDLESS" {
+				continue
+			}
 			if common.Contains(detour.Network(), N.NetworkTCP) {
 				index = i
 				defaultOutboundForConnection = detour
@@ -403,6 +413,9 @@ func (r *Router) Initialize(inbounds []adapter.Inbound, outbounds []adapter.Outb
 	}
 	if defaultOutboundForPacketConnection == nil {
 		for i, detour := range outbounds {
+			if detour.Tag() == "OUTBOUNDLESS" {
+				continue
+			}
 			if common.Contains(detour.Network(), N.NetworkUDP) {
 				packetIndex = i
 				defaultOutboundForPacketConnection = detour
@@ -411,7 +424,7 @@ func (r *Router) Initialize(inbounds []adapter.Inbound, outbounds []adapter.Outb
 		}
 	}
 	if defaultOutboundForConnection == nil || defaultOutboundForPacketConnection == nil {
-		detour := defaultOutbound()
+		detour := r.outboundByTag["OUTBOUNDLESS"]
 		if defaultOutboundForConnection == nil {
 			defaultOutboundForConnection = detour
 		}
@@ -442,6 +455,8 @@ func (r *Router) Initialize(inbounds []adapter.Inbound, outbounds []adapter.Outb
 	r.defaultOutboundForConnection = defaultOutboundForConnection
 	r.defaultOutboundForPacketConnection = defaultOutboundForPacketConnection
 	r.outboundByTag = outboundByTag
+	r.outboundProviderByTag = outboundProviderByTag
+	r.outboundProviders = outboundProviders
 	for i, rule := range r.rules {
 		if _, loaded := outboundByTag[rule.Outbound()]; !loaded {
 			return E.New("outbound not found for rule[", i, "]: ", rule.Outbound())
@@ -452,6 +467,15 @@ func (r *Router) Initialize(inbounds []adapter.Inbound, outbounds []adapter.Outb
 
 func (r *Router) Outbounds() []adapter.Outbound {
 	return r.outbounds
+}
+
+func (r *Router) OutboundProviders() []adapter.OutboundProvider {
+	return r.outboundProviders
+}
+
+func (r *Router) OutboundProvider(tag string) (adapter.OutboundProvider, bool) {
+	provider, loaded := r.outboundProviderByTag[tag]
+	return provider, loaded
 }
 
 func (r *Router) Transport(tag string) (dns.Transport, bool) {
@@ -752,6 +776,30 @@ func (r *Router) PostStart() error {
 func (r *Router) Outbound(tag string) (adapter.Outbound, bool) {
 	outbound, loaded := r.outboundByTag[tag]
 	return outbound, loaded
+}
+
+func (r *Router) OutboundWithProvider(tag string) (adapter.Outbound, bool) {
+	outbound, loaded := r.outboundByTag[tag]
+	if loaded {
+		return outbound, loaded
+	}
+	for _, provider := range r.outboundProviders {
+		outbound, loaded = provider.Outbound(tag)
+		if loaded {
+			return outbound, loaded
+		}
+	}
+	return nil, false
+}
+
+func (r *Router) OutboundsWithProvider() []adapter.Outbound {
+	outbounds := []adapter.Outbound{}
+	outbounds = append(outbounds, r.outbounds...)
+	for _, provider := range r.outboundProviders {
+		myOutbounds := provider.Outbounds()
+		outbounds = append(outbounds, myOutbounds...)
+	}
+	return outbounds
 }
 
 func (r *Router) DefaultOutbound(network string) (adapter.Outbound, error) {
@@ -1068,7 +1116,7 @@ func (r *Router) mustResolve(detour adapter.Outbound, metadata *adapter.InboundC
 		return false
 	}
 	tag := O.RealOutboundTag(detour, N.NetworkUDP)
-	outbound, _ := r.Outbound(tag)
+	outbound, _ := r.OutboundWithProvider(tag)
 	switch outbound.Type() {
 	case C.TypeBlock, C.TypeDNS, C.TypeTUIC, C.TypeHysteria, C.TypeHysteria2:
 		return false
@@ -1161,7 +1209,7 @@ func (r *Router) match0(ctx context.Context, metadata *adapter.InboundContext, d
 func (r *Router) mustUseIP(outbound adapter.Outbound, metadata *adapter.InboundContext) bool {
 	network := metadata.Network
 	tag := O.RealOutboundTag(outbound, network)
-	detour, _ := r.Outbound(tag)
+	detour, _ := r.OutboundWithProvider(tag)
 	if d, ok := detour.(adapter.OutboundUseIP); ok {
 		return d.UseIP()
 	}
